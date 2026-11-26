@@ -1037,7 +1037,13 @@
       "role": null,
       "mechanical": false,
       "behavior": {
-        "kind": "button",
+        "kind": "pad",
+        "directions": {
+          "up": null,
+          "down": null,
+          "left": null,
+          "right": null
+        },
         "press": null
       },
       "positions": [],

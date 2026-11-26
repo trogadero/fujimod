@@ -1,0 +1,14 @@
+{
+  "$schema": "https://fujimod.com/schemas/firmware.schema.json",
+  "schema": 1,
+  "id": "xpro2-511",
+  "body_id": "xpro2",
+  "version": "5.11",
+  "update": {
+    "size": 53543908,
+    "sha256": "6f9792e53a776ee116732a6df4425b0f5393ad2f53655f573924afe9c61dc54d"
+  },
+  "boot_rom": null,
+  "installation": null,
+  "generated_facts": null
+}

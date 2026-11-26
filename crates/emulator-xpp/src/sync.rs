@@ -37,6 +37,8 @@ struct State {
     status: u32,
     next: u64,
     lines: [bool; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ready_due: Option<u64>,
 }
 pub struct Generator {
     base: u64,
@@ -44,6 +46,7 @@ pub struct Generator {
     /// Line of each source that frames latch.
     frame_lines: Vec<(usize, u32)>,
     period: u64,
+    ready_after_clear: Option<u64>,
     state: State,
 }
 impl Generator {
@@ -71,11 +74,20 @@ impl Generator {
             interrupts,
             frame_lines,
             period,
+            ready_after_clear: None,
             state: State {
                 next: period,
                 ..State::default()
             },
         })
+    }
+    /// Declared simulation handshake, independent of frame cadence. X-Pro2 5.11
+    /// 0x158edac clears bit 0 then polls it only twelve times during TG setup.
+    /// This optional latency is not a measured sensor timing.
+    pub fn with_ready_after_clear(mut self, ticks: Option<u64>) -> Result<Self, String> {
+        if ticks == Some(0) { return Err("Frame sync ready latency must be positive".into()); }
+        self.ready_after_clear = ticks;
+        Ok(self)
     }
     fn update_lines(&mut self, cx: &mut Cx<'_>) {
         for &(source, irq) in &self.frame_lines {
@@ -122,6 +134,12 @@ impl Device for Generator {
         match self.offset(address, size) {
             Some(Ok(o)) => {
                 self.state.words.insert(o, value);
+                if o == 0 && value & FRAME == 0 {
+                    if let Some(delay) = self.ready_after_clear {
+                        let Some(at) = cx.now().checked_add(delay) else { return cx.fail("Frame sync ready deadline overflow"); };
+                        self.state.ready_due.get_or_insert(at);
+                    }
+                }
             }
             Some(Err(ENABLE)) => self.state.enable = value,
             Some(Err(STATUS)) => self.state.status &= !value,
@@ -130,6 +148,10 @@ impl Device for Generator {
         self.update_lines(cx);
     }
     fn advance(&mut self, cx: &mut Cx<'_>) {
+        if self.state.ready_due.is_some_and(|at| at <= cx.now()) {
+            self.state.ready_due = None;
+            *self.state.words.entry(0).or_default() |= FRAME;
+        }
         let next = self.state.next;
         if next > cx.now() {
             return;
@@ -149,7 +171,7 @@ impl Device for Generator {
         self.update_lines(cx);
     }
     fn next_deadline(&self, _now: u64) -> Option<u64> {
-        Some(self.state.next)
+        Some(self.state.ready_due.map_or(self.state.next, |at| at.min(self.state.next)))
     }
     fn save(&self) -> Value {
         serde_json::to_value(&self.state).unwrap_or(Value::Null)
@@ -165,6 +187,7 @@ impl Device for Generator {
 impl Generator {
     fn check(&self, state: &State) -> Result<(), String> {
         if state.next == 0
+            || (state.ready_due.is_some() && self.ready_after_clear.is_none())
             || state.next % self.period != 0
             || state.words.keys().any(|o| o & 3 != 0 || *o > LAST_WORD)
             || (0..SOURCES.len()).any(|source| {
@@ -184,6 +207,30 @@ mod tests {
 
     const BASE: u64 = 0xfff38000;
     const INTERRUPTS: u64 = 0xfff39140;
+
+    #[test]
+    fn declared_ready_handshake_completes_without_latching_a_frame_interrupt() {
+        let mut sync = Generator::new(BASE, INTERRUPTS, vec![(0, 102)], 1000).unwrap()
+            .with_ready_after_clear(Some(2)).unwrap();
+        let mut h = TestHost::new();
+        write(&mut sync, &mut h, INTERRUPTS, 1);
+        write(&mut sync, &mut h, BASE, 0x10);
+        let saved = sync.save();
+        assert_eq!(sync.next_deadline(0), Some(2));
+        advance(&mut sync, &mut h, 1);
+        assert_eq!(read(&mut sync, &mut h, BASE), 0x10);
+        advance(&mut sync, &mut h, 2);
+        assert_eq!(read(&mut sync, &mut h, BASE), 0x11);
+        assert_eq!(read(&mut sync, &mut h, INTERRUPTS + 4), 0);
+        assert_eq!(sync.state.lines, [false; 3]);
+        sync.restore(&saved).unwrap();
+        assert_eq!(sync.next_deadline(2), Some(2));
+        advance(&mut sync, &mut h, 2);
+        assert_eq!(read(&mut sync, &mut h, BASE), 0x11);
+        let mut baseline = Generator::new(BASE, INTERRUPTS, vec![(0, 102)], 1000).unwrap();
+        assert!(baseline.restore(&saved).is_err());
+        assert!(Generator::new(BASE, INTERRUPTS, vec![], 1000).unwrap().with_ready_after_clear(Some(0)).is_err());
+    }
 
     #[test]
     fn frames_set_the_flag_and_latch_enabled_sources_until_acknowledged() {

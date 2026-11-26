@@ -37,6 +37,7 @@ struct State {
 pub struct Converter {
     base: u64,
     samples: [u16; CHANNELS],
+    external: fujimod_emulator_devices::parts::analog::Samples,
     conversion_ticks: u64,
     state: State,
 }
@@ -51,6 +52,7 @@ impl Converter {
         Ok(Self {
             base,
             samples,
+            external: fujimod_emulator_devices::parts::analog::Samples::new(samples.to_vec())?,
             conversion_ticks,
             state: State::default(),
         })
@@ -65,17 +67,20 @@ impl Converter {
         } else {
             self.state.inputs.insert(channel, sample);
         }
-        Ok(())
+        self.external.set(channel, sample)
     }
     fn sample(&self, channel: usize) -> u16 {
-        self.state
-            .inputs
-            .get(&channel)
-            .copied()
-            .unwrap_or(self.samples[channel])
+        self.external.get(channel).expect("validated ADC channel")
     }
 }
+impl fujimod_emulator_devices::capability::AnalogInputs for Converter {
+    fn external_inputs(&self) -> fujimod_emulator_devices::parts::analog::Samples { self.external.clone() }
+    fn samples(&self) -> Vec<u16> { self.external.values() }
+    fn set_sample(&mut self, channel: usize, value: u16) -> Result<(), String> { self.set_input(channel, value) }
+}
 impl Device for Converter {
+    fn analog_inputs(&self) -> Option<&(dyn fujimod_emulator_devices::capability::AnalogInputs + 'static)> { Some(self) }
+    fn analog_inputs_mut(&mut self) -> Option<&mut (dyn fujimod_emulator_devices::capability::AnalogInputs + 'static)> { Some(self) }
     fn name(&self) -> &'static str {
         "xpp-adc"
     }
@@ -146,15 +151,45 @@ impl Device for Converter {
         self.state.deadline
     }
     fn save(&self) -> Value {
-        serde_json::to_value(&self.state).unwrap_or(Value::Null)
+        let mut value = serde_json::to_value(&self.state).unwrap_or(Value::Null);
+        value["external_samples"] = serde_json::json!(self.external.values());
+        value
     }
     fn restore(&mut self, value: &Value) -> Result<(), String> {
-        let state: State = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+        let mut value = value.clone();
+        let samples: Option<Vec<u16>> = value.as_object_mut().ok_or("ADC state must be an object")?
+            .remove("external_samples").map(serde_json::from_value).transpose().map_err(|e| e.to_string())?;
+        let state: State = serde_json::from_value(value).map_err(|e| e.to_string())?;
         self.check(&state)?;
+        let samples = samples.unwrap_or_else(|| {
+            let mut values = self.samples.to_vec();
+            for (&channel, &sample) in &state.inputs { values[channel] = sample; }
+            values
+        });
+        if samples.len() != CHANNELS || samples.iter().any(|&v| v > 0x3ff) { return Err("invalid ADC sample snapshot".into()); }
+        self.external.replace(&samples)?;
         self.state = state;
         Ok(())
     }
-    fujimod_emulator_devices::checkpoint_state!(state: State, Self::check);
+    fn checkpoint(&self) -> Result<fujimod_emulator_devices::checkpoint::Checkpoint, String> {
+        fujimod_emulator_devices::checkpoint::Checkpoint::encode(self.name(), &(&self.state, self.external.values()))
+    }
+    fn validate_checkpoint(&self, saved: &fujimod_emulator_devices::checkpoint::Checkpoint) -> Result<(), String> {
+        let (state, samples): (State, Vec<u16>) = saved.decode(self.name())?;
+        self.check(&state)?;
+        if samples.len() != CHANNELS || samples.iter().any(|&v| v > 0x3ff) || !saved.children().is_empty() || !saved.blobs().is_empty() {
+            return Err("invalid ADC sample snapshot".into());
+        }
+        Ok(())
+    }
+    fn restore_checkpoint(&mut self, saved: &fujimod_emulator_devices::checkpoint::Checkpoint) -> Result<(), String> {
+        self.validate_checkpoint(saved)?;
+        let (state, samples): (State, Vec<u16>) = saved.decode(self.name())?;
+        self.external.replace(&samples)?;
+        self.state = state;
+        Ok(())
+    }
+    fn fingerprint(&self) -> Result<Value, String> { Ok(self.save()) }
 }
 impl Converter {
     fn check(&self, state: &State) -> Result<(), String> {
@@ -186,6 +221,22 @@ mod tests {
         Converter::new(BASE, &samples, 16).unwrap()
     }
 
+    #[test]
+    fn contact_capability_and_shared_samples_restore_together() {
+        use fujimod_emulator_devices::capability::AnalogInputs;
+        let mut adc = converter();
+        let pins = adc.external_inputs();
+        pins.set(3, 500).unwrap();
+        assert_eq!(adc.sample(3), 500);
+        let saved = adc.checkpoint().unwrap();
+        adc.set_sample(3, 700).unwrap();
+        assert_eq!(pins.get(3).unwrap(), 700);
+        adc.restore_checkpoint(&saved).unwrap();
+        assert_eq!(pins.get(3).unwrap(), 500);
+        assert_eq!(adc.samples()[3], 500);
+        assert!(adc.set_sample(3, 1024).is_err());
+        assert_eq!(pins.get(3).unwrap(), 500);
+    }
     #[test]
     fn single_conversions_clear_start_after_the_conversion_clock() {
         assert!(Converter::new(BASE, &[0; 11], 16).is_err());

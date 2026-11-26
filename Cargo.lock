@@ -1743,6 +1743,7 @@ dependencies = [
  "fujimod-emulator-preparation",
  "fujimod-emulator-session",
  "fujimod-emulator-xpp",
+ "fujimod-firmware",
  "fujimod-recording",
  "fujimod-settings",
  "fujimod-workspace-hack",
@@ -2287,6 +2288,7 @@ dependencies = [
  "fujimod-emulator-storage",
  "fujimod-emulator-xp5-board",
  "fujimod-emulator-xp5-display",
+ "fujimod-emulator-xpp",
  "fujimod-firmware",
  "fujimod-workspace-hack",
  "js-sys",
@@ -2579,6 +2581,8 @@ version = "0.1.0"
 dependencies = [
  "fujimod-emulator",
  "fujimod-emulator-devices",
+ "fujimod-emulator-exr2-images",
+ "fujimod-emulator-exr2-resources",
  "fujimod-emulator-graphics",
  "fujimod-emulator-image-codecs",
  "fujimod-emulator-imaging",
@@ -2587,6 +2591,8 @@ dependencies = [
  "fujimod-emulator-ip-dmp",
  "fujimod-emulator-storage",
  "fujimod-emulator-xp4-io",
+ "fujimod-framebuffer",
+ "fujimod-framebuffer-xpp",
  "fujimod-virtual-scene",
  "fujimod-workspace-hack",
  "serde",
@@ -2600,6 +2606,25 @@ dependencies = [
  "fujimod-workspace-hack",
  "sha2 0.11.1",
  "thiserror",
+]
+
+[[package]]
+name = "fujimod-framebuffer"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "fujimod-framebuffer-xpp"
+version = "0.1.0"
+dependencies = [
+ "fujimod-framebuffer",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

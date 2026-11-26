@@ -459,6 +459,11 @@ impl Board {
             .map(|c| &**c)
             .ok_or("absent processor".into())
     }
+    /// Keep a processor alive for bounded host observation hooks.
+    /// Callers must still remove their hooks before dropping hook contexts.
+    pub fn cpu_handle(&self, index: usize) -> Result<Rc<dyn Cpu>, String> {
+        self.cpus.get(index).cloned().ok_or("absent processor".into())
+    }
     pub fn instruction_counts(&self) -> Vec<u64> {
         self.state.borrow().instructions.clone()
     }

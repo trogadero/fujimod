@@ -603,7 +603,7 @@ impl Compiler {
         import(&mut imports, "memory", 2)?;
         if cfg!(all(target_arch = "wasm32", target_feature = "atomics")) {
             imports.extend(&[3, 1]);
-            imports.unsigned(32768); // Shared wasm32 memory, maximum 2 GiB.
+            imports.unsigned(65536); // Accept shared wasm32 heaps up to the 4 GiB address limit.
         } else {
             imports.extend(&[0, 1]);
         }
@@ -701,7 +701,7 @@ impl Compiler {
         import(&mut imports, "memory", 2)?;
         if cfg!(all(target_arch = "wasm32", target_feature = "atomics")) {
             imports.extend(&[3, 1]);
-            imports.unsigned(32768); // Shared wasm32 memory, maximum 2 GiB.
+            imports.unsigned(65536); // Accept shared wasm32 heaps up to the 4 GiB address limit.
         } else {
             imports.extend(&[0, 1]);
         }

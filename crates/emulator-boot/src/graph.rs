@@ -546,7 +546,7 @@ fn dma_map(map: &BusMapping) -> Value {
 
 /// Serialize the validated processor graph in the same closed shape accepted
 /// by `factory::Graph` deserialization for native callers.
-pub(super) fn value(
+pub fn value(
     selection: &ResolvedSelection,
     graph: &factory::Graph,
     rate: RunInstructionRate,

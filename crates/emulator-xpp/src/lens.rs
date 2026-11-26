@@ -56,6 +56,8 @@ const ACK: u32 = 0x0800_8000;
 const READ_SESSION: u32 = 0x14;
 const WRITE_SESSION: u32 = 0x15;
 const PAGE_SIZE: u32 = 0x18;
+const EMPTY_EXTENDED: u32 = 0xc0;
+const EXTENDED_BYTES: usize = 2048;
 /// Commands after which the lens moves and holds the ready line low.
 const MOVES: [u32; 2] = [0x40, 0x56];
 
@@ -74,7 +76,7 @@ fn command(word: u32) -> u32 {
     (word & 0x7fff) >> 6
 }
 fn is_message(word: u32) -> bool {
-    word != 0 && word & 0x8000 == 0
+    word != 0 && word & 0x8001 == 0
 }
 
 /// What the lens answers: its information page and command replies.
@@ -82,6 +84,10 @@ fn is_message(word: u32) -> bool {
 pub struct Profile {
     pub page: Vec<u8>,
     pub replies: BTreeMap<u32, u16>,
+    /// Explicit negative replies; these do not advertise unsupported calibration data.
+    pub rejected_commands: Vec<u32>,
+    /// Declared zero-page lens ROM for menu tests, not optical calibration.
+    pub empty_extended_data: bool,
 }
 /// Declared lens delays and the power sampling period, in ticks.
 #[derive(Clone, Copy, Debug)]
@@ -98,6 +104,9 @@ pub struct Timing {
 pub struct Wiring {
     pub base: u64,
     pub power: (usize, usize, usize),
+    /// Some bodies drive an active-low supply through a separately enabled output.
+    pub power_active_low: bool,
+    pub power_enable: Option<(usize, usize, usize)>,
     pub ready: (usize, usize),
     pub line: usize,
     pub contacts: Vec<(usize, usize, bool)>,
@@ -215,10 +224,14 @@ impl LensPort {
         if link.base != wiring.base
             || profile.page.is_empty()
             || profile.page.len() > PAGE_BYTES
+            || (profile.empty_extended_data && (profile.replies.get(&EMPTY_EXTENDED) != Some(&0)
+                || profile.rejected_commands.contains(&EMPTY_EXTENDED)))
             || profile.replies.keys().any(|id| *id >= 0x200)
+            || profile.rejected_commands.iter().any(|id| *id >= 0x200 || profile.replies.contains_key(id))
             || [timing.ready, timing.release, timing.drive, timing.poll].contains(&0)
             || !pin((wiring.power.0, wiring.power.2))
             || wiring.power.1 >= 5
+            || wiring.power_enable.is_some_and(|(port, register, bit)| !pin((port, bit)) || register >= 5)
             || !pin(wiring.ready)
             || wiring.contacts.iter().any(|&(port, p, _)| !pin((port, p)))
         {
@@ -257,6 +270,19 @@ impl LensPort {
         link.busy = true;
         link.out = match link.bulk {
             None => link.word.to_be_bytes().to_vec(),
+            Some(EMPTY_EXTENDED) => {
+                // Stock b3ef48 with count=0 requests 1, FFFF, then FF00.
+                // b3e61c returns 1 on a received FFFF, closing the driver.
+                // Keep the marker exchange open until the final request.
+                // Every data index is outside the advertised ROM, so no
+                // calibration bytes are copied into the camera's cache.
+                let header = [0x0001_u16, 0xff00, 0xffff][link.page.min(2)];
+                let mut out = header.to_be_bytes().to_vec();
+                out.resize(EXTENDED_BYTES + 2, 0);
+                let sum = out.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+                out.push(sum);
+                out
+            }
             Some(WRITE_SESSION) => {
                 let mut out = if link.page == 0 {
                     vec![0xff, 0xff]
@@ -285,6 +311,15 @@ impl LensPort {
     fn end(&mut self, cx: &mut Cx<'_>, link: &mut Link) {
         link.busy = false;
         if let Some(session) = link.bulk {
+            if session == EMPTY_EXTENDED {
+                link.page += 1;
+                if link.page == 3 {
+                    link.bulk = None;
+                    link.acknowledge = false;
+                    link.word = 0;
+                }
+                return;
+            }
             let last: &[u8] = if session == WRITE_SESSION {
                 &[0xff, 0]
             } else {
@@ -322,9 +357,10 @@ impl LensPort {
             link.reply = 0;
             if received != 0 {
                 let id = command(received);
-                if id == PAGE_SIZE {
+                let rejected = self.profile.rejected_commands.contains(&id);
+                if id == PAGE_SIZE && !rejected {
                     link.page_size = 1 << (received >> 27 & 0xf);
-                } else if MOVES.contains(&id) && self.line.released {
+                } else if !rejected && MOVES.contains(&id) && self.line.released {
                     self.line.drives += 1;
                     if self.line.drive_until.is_none() {
                         self.set_ready(cx, false);
@@ -333,19 +369,22 @@ impl LensPort {
                 }
                 let data = match self.profile.replies.get(&id) {
                     Some(&data) => u32::from(data),
+                    None if rejected => 0,
                     None => {
                         *self.line.unknown.entry(id).or_default() += 1;
                         0
                     }
                 };
-                link.reply = seal(data << 16 | id << 6);
+                link.reply = seal(data << 16 | id << 6)
+                    | u32::from(rejected);
             }
             link.word = seal(ack);
             link.acknowledge = true;
         } else {
             link.word = link.reply;
             link.acknowledge = false;
-            if is_message(link.sent) && [READ_SESSION, WRITE_SESSION].contains(&command(link.sent))
+            if is_message(link.sent) && ([READ_SESSION, WRITE_SESSION].contains(&command(link.sent))
+                || self.profile.empty_extended_data && command(link.sent) == EMPTY_EXTENDED)
             {
                 link.bulk = Some(command(link.sent));
                 link.page = 0;
@@ -355,7 +394,9 @@ impl LensPort {
     }
     fn power(&self) -> bool {
         let (port, register, bit) = self.wiring.power;
-        self.pins.lock().unwrap().register(port, register) >> bit & 1 != 0
+        let pins = self.pins.lock().unwrap();
+        let enabled = self.wiring.power_enable.is_none_or(|(p, r, b)| pins.register(p, r) >> b & 1 != 0);
+        enabled && ((pins.register(port, register) >> bit & 1 != 0) != self.wiring.power_active_low)
     }
 }
 impl Device for LensPort {
@@ -506,7 +547,8 @@ impl Device for LensPort {
 }
 impl LensPort {
     fn check(&self, link: &Link, line: &Line) -> Result<(), String> {
-        if line.poll_at % self.timing.poll != 0 || link.page_size > 1 << 15 {
+        if line.poll_at % self.timing.poll != 0 || link.page_size > 1 << 15
+            || link.bulk == Some(EMPTY_EXTENDED) && link.page >= 3 {
             return Err("Invalid lens checkpoint".into());
         }
         Ok(())
@@ -527,6 +569,8 @@ mod tests {
         let profile = Profile {
             page: b"LY043A\0\0FLSNW039AF 25/1.7 XF".to_vec(),
             replies: BTreeMap::from([(0x20, 0x300), (0x26, 0x1c)]),
+            rejected_commands: vec![],
+            empty_extended_data: false,
         };
         let timing = Timing {
             ready: 100,
@@ -537,6 +581,8 @@ mod tests {
         let wiring = Wiring {
             base: BASE,
             power: (14, 1, 0),
+            power_active_low: false,
+            power_enable: None,
             ready: (14, 1),
             line: 15,
             contacts: vec![(14, 0, true), (11, 0, true), (11, 1, false), (11, 2, true)],
@@ -586,6 +632,46 @@ mod tests {
             transfer(&mut lens, &mut h, 0),
             seal(0x300 << 16 | 0x20 << 6)
         );
+    }
+
+    #[test]
+    fn zero_page_extended_rom_drains_the_stock_termination_sequence() {
+        let (mut lens, _) = lens();
+        lens.profile.empty_extended_data = true;
+        lens.profile.replies.insert(EMPTY_EXTENDED, 0);
+        let mut h = TestHost::new();
+        transfer(&mut lens, &mut h, seal(6 << 16 | EMPTY_EXTENDED << 6));
+        transfer(&mut lens, &mut h, seal(ACK | EMPTY_EXTENDED << 6));
+        assert_eq!(transfer(&mut lens, &mut h, 0), seal(EMPTY_EXTENDED << 6));
+        transfer(&mut lens, &mut h, seal(ACK | EMPTY_EXTENDED << 6));
+        let data = data(&lens);
+        for header in [0x0001_u16, 0xff00, 0xffff] {
+            write(&mut lens, &mut h, BASE + TRANSFER, 3);
+            let bytes = data.read(BASE + RECEIVE, EXTENDED_BYTES + 3).unwrap();
+            assert_eq!(&bytes[..2], &header.to_be_bytes());
+            assert!(bytes[2..EXTENDED_BYTES+2].iter().all(|b| *b == 0));
+            assert_eq!(bytes[EXTENDED_BYTES+2], bytes[..EXTENDED_BYTES+2].iter().fold(0u8, |s,b|s.wrapping_add(*b)));
+            write(&mut lens, &mut h, BASE + TRANSFER, 0);
+        }
+        assert_eq!(lens.link.lock().unwrap().bulk, None);
+        assert_eq!(transfer(&mut lens, &mut h, seal(0x20 << 6)), 0);
+    }
+
+    #[test]
+    fn declared_rejection_sets_error_without_starting_a_bulk_session() {
+        for id in [0xc0, READ_SESSION, WRITE_SESSION, PAGE_SIZE] {
+            let (mut lens, _) = lens();
+            lens.profile.rejected_commands.push(id);
+            let mut h = TestHost::new();
+            transfer(&mut lens, &mut h, seal(6 << 16 | id << 6));
+            transfer(&mut lens, &mut h, seal(ACK | id << 6));
+            let response = transfer(&mut lens, &mut h, 0);
+            assert_eq!(response, seal(id << 6) | 1);
+            transfer(&mut lens, &mut h, seal(ACK | id << 6));
+            assert_eq!(lens.link.lock().unwrap().bulk, None);
+            assert_eq!(lens.link.lock().unwrap().page_size, PAGE_BYTES);
+            assert_eq!(transfer(&mut lens, &mut h, seal(0x20 << 6)), 0);
+        }
     }
 
     #[test]
@@ -659,6 +745,33 @@ mod tests {
         advance(&mut lens, &mut h, 1160);
         assert!(pins.lock().unwrap().input(14, 1));
         assert_eq!(lens.line.drives, 1);
+    }
+
+    #[test]
+    fn active_low_supply_waits_for_output_enable_and_stops_when_disabled() {
+        let (mut lens, pins) = lens();
+        lens.wiring.power = (14, 0, 0);
+        lens.wiring.power_active_low = true;
+        lens.wiring.power_enable = Some((14, 1, 0));
+        let mut h = TestHost::new();
+        let base = 0xfff0_c000 + 14 * 0x40;
+        let gpio = &mut fujimod_emulator_ip::socionext::gpio::Gpio::new(0xfff0_c000, pins.clone()).unwrap();
+        advance(&mut lens, &mut h, 10);
+        assert!(!lens.line.powered); // Default low data is not a driven output.
+        write(gpio, &mut h, base, 0x0001_0001);
+        write(gpio, &mut h, base + 4, 0x0001_0001);
+        advance(&mut lens, &mut h, 20);
+        assert!(!lens.line.powered); // Enabled high output keeps the supply off.
+        write(gpio, &mut h, base, 0x0001_0000);
+        advance(&mut lens, &mut h, 30);
+        assert!(lens.line.powered);
+        advance(&mut lens, &mut h, 130);
+        assert!(!pins.lock().unwrap().input(14, 1));
+        write(gpio, &mut h, base + 4, 0x0001_0000);
+        advance(&mut lens, &mut h, 140);
+        assert!(!lens.line.powered);
+        assert!(pins.lock().unwrap().input(14, 1));
+        assert_eq!(lens.line.release_at, None);
     }
 
     #[test]

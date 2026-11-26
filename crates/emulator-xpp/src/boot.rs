@@ -18,6 +18,8 @@ pub struct Options {
     pub card_selector: u32,
     pub settle_ticks: u64,
     pub refresh_level: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub training_result: Option<u32>,
 }
 #[derive(Serialize, Deserialize)]
 struct State {
@@ -60,7 +62,8 @@ impl BootController {
         let power =
             crate::power::Control::new(options.clock_base)?.with_startup(options.settle_ticks)?;
         let dram = crate::dram::Controller::new(options.ddr_base, options.refresh_level)?
-            .with_startup(options.settle_ticks)?;
+            .with_startup(options.settle_ticks)?
+            .with_training_result(options.training_result)?;
         Ok(Self {
             options,
             contacts,
@@ -247,6 +250,7 @@ mod tests {
             card_selector: 0,
             settle_ticks: 5,
             refresh_level: 0,
+            training_result: None,
         };
         let mut d = BootController::new(options, levels.clone()).unwrap();
         let reset = d.sd_reset(0).unwrap();

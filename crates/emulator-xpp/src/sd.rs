@@ -7,14 +7,16 @@
 //! update and bit 26 acknowledges it while bit 24 is set (polled up to 1000
 //! times at 0xc64bd8); updates complete at once. An optional reset input
 //! line resets the SDHCI bank once per pulse, before the next access.
+//! X-Pro2 5.11 0xb22a30 selects +0xb0 for that handshake on the second
+//! controller (+0x100 SDHCI bank); 0xb22924..0xb22990 uses the same request,
+//! acknowledge and clear sequence as the first controller at +0x10.
 use fujimod_emulator_devices::{Cx, Device};
 use fujimod_emulator_ip::sdhci::host::{self, SdHost};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-const VENDOR: [u64; 4] = [0x10, 0x20, 0x24, 0xec];
-const UPDATE: u64 = 0x10;
+const VENDOR: [u64; 3] = [0x20, 0x24, 0xec];
 const UPDATE_REQUEST: u32 = 1 << 24;
 const UPDATE_DONE: u32 = 1 << 26;
 
@@ -45,6 +47,16 @@ pub struct Controller {
     reset: Option<(crate::resets::ResetPulses, u64)>,
 }
 impl Controller {
+    fn update_offset(&self) -> u64 {
+        if self.options.register_offset == 0x100 {
+            0xb0
+        } else {
+            0x10
+        }
+    }
+    fn vendor_offset(&self, offset: u64) -> bool {
+        VENDOR.contains(&offset) || offset == self.update_offset()
+    }
     pub fn new(
         options: Options,
         card: fujimod_emulator_devices::parts::sd_card::Card,
@@ -110,21 +122,23 @@ impl Controller {
             self.host.hardware_reset(cx)?;
         }
         let vendor = address.wrapping_sub(self.options.base);
-        if size == 4 && VENDOR.contains(&vendor) {
+        if size == 4 && self.vendor_offset(vendor) {
             if let Some(v) = value {
-                if vendor == UPDATE && v as u32 & UPDATE_DONE != 0 {
+                if vendor == self.update_offset() && v as u32 & UPDATE_DONE != 0 {
                     return Err("SD update acknowledge is read-only".into());
                 }
                 self.vendor.insert(vendor, v as u32);
                 return Ok(0);
             }
             let word = self.vendor.get(&vendor).copied().unwrap_or(0);
-            return Ok(if vendor == UPDATE && word & UPDATE_REQUEST != 0 {
-                word | UPDATE_DONE
-            } else {
-                word
-            }
-            .into());
+            return Ok(
+                if vendor == self.update_offset() && word & UPDATE_REQUEST != 0 {
+                    word | UPDATE_DONE
+                } else {
+                    word
+                }
+                .into(),
+            );
         }
         if address == self.options.base && size == 4 {
             if let Some(v) = value {
@@ -248,7 +262,7 @@ impl Device for Controller {
         if options != self.options {
             return Err("SD wrapper checkpoint wiring differs".into());
         }
-        if vendor.keys().any(|offset| !VENDOR.contains(offset))
+        if vendor.keys().any(|offset| !self.vendor_offset(*offset))
             || seen.is_some() != self.reset.is_some()
         {
             return Err("SD wrapper checkpoint vendor/reset shape differs".into());
@@ -461,7 +475,43 @@ mod tests {
         let mut a = controller();
         let b = controller();
         assert_eq!(a.fingerprint().unwrap(), b.fingerprint().unwrap());
-        a.vendor.insert(0x10, 1);
+        a.vendor.insert(0xb0, 1);
         assert_ne!(a.fingerprint().unwrap(), b.fingerprint().unwrap());
+    }
+
+    #[test]
+    fn second_controller_handshake_restores_and_rejects_invalid_acknowledgement() {
+        let card = Card::new(CardOptions {
+            sectors: 0x800000,
+            max_dirty_sectors: 4,
+        })
+        .unwrap();
+        let options = Options {
+            base: 0xfff93000,
+            register_offset: 0x100,
+            transfer_ticks: 10,
+            clock_ticks: 2,
+            reset_ticks: 3,
+            rca: 1,
+            ram_bytes: 0x10000,
+            high_speed: false,
+            ram_banks: vec![],
+        };
+        let mut d = Controller::new(options, card, Contacts::new(true, false), None).unwrap();
+        let mut h = TestHost::new();
+        write(&mut d, &mut h, 0xfff930b0, 0x1000001);
+        assert_eq!(read(&mut d, &mut h, 0xfff930b0), 0x5000001);
+        let saved = d.checkpoint().unwrap();
+        write(&mut d, &mut h, 0xfff930b0, 1);
+        assert_eq!(read(&mut d, &mut h, 0xfff930b0), 1);
+        d.restore_checkpoint(&saved).unwrap();
+        assert_eq!(read(&mut d, &mut h, 0xfff930b0), 0x5000001);
+        assert!(
+            d.transfer(&mut h.cx(), 0xfff930b0, 4, Some(0x4000000))
+                .is_err()
+        );
+        assert!(d.transfer(&mut h.cx(), 0xfff930b4, 4, None).is_err());
+        assert!(d.transfer(&mut h.cx(), 0xfff930b0, 2, None).is_err());
+        assert!(d.transfer(&mut h.cx(), 0xfff93010, 4, None).is_err());
     }
 }

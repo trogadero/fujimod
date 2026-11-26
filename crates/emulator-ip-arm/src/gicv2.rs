@@ -92,13 +92,19 @@ impl Gic {
     }
     pub fn set_line(&mut self, line: usize, high: bool) {
         if line >= 32 && line < self.lines {
+            let pending = self.pending[0][line];
             let edge = self.config[line / 16] & (2 << (line % 16 * 2)) != 0;
             if !edge || high && !self.levels[line] {
                 self.pending[0][line] = high;
             }
             self.levels[line] = high;
+            // Eligibility depends on pending/enabled, not the pin level.
+            // Keep masked edges latched for a later enable, without scanning
+            // every interrupt twice for each fast peripheral clock pulse.
+            if pending != self.pending[0][line] && self.enabled[0][line] {
+                self.refresh();
+            }
         }
-        self.refresh();
     }
     pub fn pulse(&mut self, line: usize) {
         if line < self.lines {
@@ -458,6 +464,28 @@ impl Gic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn masked_and_repeated_edges_keep_pending_and_future_enable_semantics() {
+        let mut g = Gic::new(2, 128);
+        g.access(0, true, 0, 4, true, 1).unwrap();
+        g.access(0, false, 0, 4, true, 1).unwrap();
+        g.access(0, false, 4, 4, true, 255).unwrap();
+        g.access(0, true, 0xc0c, 4, true, 2 << 26).unwrap(); // SPI61 edge
+        for high in [true, false, true, false] { g.set_line(61, high); }
+        assert!(g.pending[0][61]);
+        assert_eq!(g.next_irq(0), None);
+        g.access(0, true, 0x104, 4, true, 1 << 29).unwrap();
+        assert_eq!(g.next_irq(0), Some(61));
+        for high in [true, false, true, false] { g.set_line(61, high); }
+        assert_eq!(g.next_irq(0), Some(61));
+        let mut recomputed = g.clone();
+        recomputed.refresh();
+        assert_eq!(g.save(), recomputed.save());
+        assert_eq!(g.access(0, false, 12, 4, false, 0).unwrap(), 61);
+        assert_eq!(g.next_irq(0), None);
+        g.access(0, false, 16, 4, true, 61).unwrap();
+        assert_eq!(g.next_irq(0), None);
+    }
     #[test]
     fn banked_sgi_pending_bytes_preserve_sources_active_state_and_other_targets() {
         let mut g = Gic::new(2, 64);

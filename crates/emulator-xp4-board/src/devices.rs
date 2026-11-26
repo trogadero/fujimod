@@ -964,6 +964,8 @@ impl Devices {
             Wiring {
                 base,
                 power: lens.power,
+                power_active_low: false,
+                power_enable: None,
                 ready: lens.ready,
                 line: lens.line,
                 contacts: lens.contacts,

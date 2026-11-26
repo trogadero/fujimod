@@ -1,5 +1,7 @@
 //! X-Processor Pro reset and gate controls at 0xfff0a000.
 //!
+//! X-Pro2 5.11 routine 0xb22dc4 reads/modifies word +0x8c in two-bit fields;
+//! it is retained here without claiming hardware timing or side effects.
 //! Words read back their last write. The X-T20 2.11 SD start-up 0xc65b18
 //! drives +0x1c bit 18, 19 or 20 low and then high for SD channel 0, 1 or 2
 //! and then sets bit 0. A falling edge of a channel bit is a hardware reset
@@ -29,8 +31,8 @@ use std::sync::{Arc, Mutex};
 
 /// Register window size in bytes.
 pub const WINDOW: u64 = 0x1000;
-const WORDS: [u64; 12] = [
-    0x08, 0x14, 0x1c, 0x20, 0x6c, 0x70, 0x88, 0x9c, 0x100, 0x10c, 0x110, 0x118,
+const WORDS: [u64; 13] = [
+    0x08, 0x14, 0x1c, 0x20, 0x6c, 0x70, 0x88, 0x8c, 0x9c, 0x100, 0x10c, 0x110, 0x118,
 ];
 const SD_RESETS: u64 = 0x1c;
 const SD_CHANNELS: usize = 3;
@@ -295,6 +297,19 @@ mod tests {
     use fujimod_emulator_devices::test_host::{TestHost, read, write};
 
     const BASE: u64 = 0xfff0a000;
+
+    #[test]
+    fn xpro2_pad_word_restores_without_accepting_adjacent_unknown_words() {
+        let mut gates = Gates::new(BASE).unwrap();
+        let mut h = TestHost::new();
+        write(&mut gates, &mut h, BASE + 0x8c, 0xfff);
+        let saved = gates.checkpoint().unwrap();
+        write(&mut gates, &mut h, BASE + 0x8c, 0xa55);
+        gates.restore_checkpoint(&saved).unwrap();
+        assert_eq!(read(&mut gates, &mut h, BASE + 0x8c), 0xfff);
+        assert_eq!(gates.offset(BASE + 0x90, 4), None);
+        assert_eq!(gates.offset(BASE + 0x8c, 2), None);
+    }
 
     #[test]
     fn falling_sd_bits_pulse_their_channel_and_words_read_back() {

@@ -78,6 +78,7 @@ pub struct Renderer {
     base: u64,
     irq: u32,
     webgpu_bridge: bool,
+    copy_latency_divisor: u64,
 }
 impl Renderer {
     pub fn new(base: u64, irq: u32) -> Result<Self, String> {
@@ -89,7 +90,17 @@ impl Renderer {
             base,
             irq,
             webgpu_bridge: crate::webgpu_bridge_enabled(),
+            copy_latency_divisor: 1,
         })
+    }
+    /// Declared simulation throughput, not measured camera DMA performance.
+    /// The board definition owns this immutable setting across restores.
+    pub fn with_copy_latency_divisor(mut self, divisor: u64) -> Result<Self, String> {
+        if !(1..=1024).contains(&divisor) {
+            return Err("DMP copy latency divisor must be between 1 and 1024".into());
+        }
+        self.copy_latency_divisor = divisor;
+        Ok(self)
     }
 }
 
@@ -1211,8 +1222,8 @@ mod tests {
     }
     #[test]
     fn pending_dma_has_exact_deadline_early_noop_and_restorable_program_independent_effects() {
-        let experiment = |base, irq, pc, core| {
-            let mut renderer = Renderer::new(base, irq).unwrap();
+        let experiment = |base, irq, pc, core, divisor, deadline| {
+            let mut renderer = Renderer::new(base, irq).unwrap().with_copy_latency_divisor(divisor).unwrap();
             let mut host = RecordingHost {
                 now: 100,
                 ram_base: 0x1000,
@@ -1230,17 +1241,17 @@ mod tests {
                 assert!(cx.refusal().is_none(), "{:?}", cx.refusal());
             }
             let before = renderer.save();
-            assert_eq!(renderer.next_deadline(host.now), Some(1260));
+            assert_eq!(renderer.next_deadline(host.now), Some(deadline));
             let token = host.events[0].2;
-            host.now = 1259;
+            host.now = deadline - 1;
             renderer.event(&mut Cx::new(&mut host, core, pc, 0), token);
             renderer.advance(&mut Cx::new(&mut host, core, pc, 0));
             assert_eq!(renderer.save(), before);
             assert_eq!(host.ram, vec![0xa5; 64]);
             assert!(host.irqs.is_empty());
-            let mut restored = Renderer::new(base, irq).unwrap();
+            let mut restored = Renderer::new(base, irq).unwrap().with_copy_latency_divisor(divisor).unwrap();
             restored.restore(&before).unwrap();
-            host.now = 1260;
+            host.now = deadline;
             renderer.event(&mut Cx::new(&mut host, core, pc, 0), token + 1);
             assert_eq!(renderer.save(), before);
             restored.advance(&mut Cx::new(&mut host, core, pc, 0));
@@ -1255,9 +1266,14 @@ mod tests {
             (done, host.ram)
         };
         assert_eq!(
-            experiment(0xff93c000, 153, 0x1000, 0),
-            experiment(0xfffd0000, 92, 0x2345678, 3)
+            experiment(0xff93c000, 153, 0x1000, 0, 1, 1260),
+            experiment(0xfffd0000, 92, 0x2345678, 3, 1, 1260)
         );
+        assert_eq!(
+            experiment(0xff93c000, 153, 0x1000, 0, 1, 1260),
+            experiment(0xff93c000, 153, 0x1000, 0, 64, 1103)
+        );
+        assert!(Renderer::new(0xfff88000, 92).unwrap().with_copy_latency_divisor(0).is_err());
     }
     #[test]
     fn copy_unit_configuration_stores_only_the_initialization_value() {
@@ -1516,9 +1532,9 @@ impl State {
             Ok(())
         }
     }
-    fn begin(&mut self, cx: &mut Cx<'_>, job: Job) {
+    fn begin(&mut self, cx: &mut Cx<'_>, job: Job, copy_latency_divisor: u64) {
         let count = job.writes.iter().map(|(_, b)| b.len() as u64).sum::<u64>();
-        let Some(at) = cx.now().checked_add(1000 + count * 5) else {
+        let Some(at) = cx.now().checked_add(1000 + (count * 5).div_ceil(copy_latency_divisor)) else {
             cx.fail("DMP DMA deadline overflow");
             return;
         };
@@ -1747,12 +1763,12 @@ impl Device for Renderer {
                 0x1c if v != 0 => {
                     let job = s.fill_job(cx, v)?;
                     s.regs.insert(o, v);
-                    s.begin(cx, job);
+                    s.begin(cx, job, self.copy_latency_divisor);
                 }
                 0xc18 if v != 0 => {
                     let job = s.copy_job(cx, v)?;
                     s.regs.insert(o, v);
-                    s.begin(cx, job);
+                    s.begin(cx, job, self.copy_latency_divisor);
                 }
                 0xc1c if v != 0x8000 => {
                     return Err("DMP unsupported reset control".into());
@@ -1784,7 +1800,7 @@ impl Device for Renderer {
                     s.path_pending = None;
                     s.command_ack = 0;
                     s.regs.insert(o, v);
-                    s.begin(cx, job);
+                    s.begin(cx, job, self.copy_latency_divisor);
                 }
                 0x20f0 if v == 1 => {
                     s.idle()?;
@@ -1815,6 +1831,7 @@ impl Device for Renderer {
                                 writes,
                                 banks: None,
                             },
+                            self.copy_latency_divisor,
                         );
                     }
                 }
@@ -1937,6 +1954,7 @@ impl Device for Renderer {
                 writes,
                 banks: None,
             },
+            self.copy_latency_divisor,
         );
         Ok(())
     }

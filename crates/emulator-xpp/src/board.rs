@@ -38,6 +38,9 @@ pub struct Spec {
     pub cpus: Vec<board::armv7a::Config>,
     pub gic: Gic,
     pub nodes: Vec<Node>,
+    /// Named, bounded post-ISP image inputs; pixel bytes arrive through setScene.
+    #[serde(default)]
+    pub images: BTreeMap<String, fujimod_emulator_imaging::analysis::ImageLayout>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -92,6 +95,9 @@ pub struct LiveViewImage {
     /// Host RGB image that replaces the uniform image.
     #[serde(default)]
     pub host_image: Option<HostImage>,
+    /// Dynamic image input; no binary payload in the graph document.
+    #[serde(default)]
+    pub input: Option<String>,
     /// Uniform scene developed with the color unit's film law and white
     /// balance, in place of the fixed `ycbcr` pair (which stays as the image
     /// until the firmware programs the unit).
@@ -169,6 +175,8 @@ pub enum Model {
     Boot {
         options: boot::Options,
         keys: Vec<String>,
+        #[serde(default)]
+        high_keys: Vec<String>,
     },
     Sd {
         options: sd::Options,
@@ -183,6 +191,12 @@ pub enum Model {
         base: u64,
         routes: Vec<(usize, usize)>,
     },
+    InputCaptureIdle {
+        base: u64,
+        channels: u64,
+    },
+    /// Experimental finite counter-command sequence with an explicit end IRQ.
+    InputCaptureSequence { base: u64, channels: u64, irq: u32 },
     SerialConfiguration {
         base: u64,
     },
@@ -306,13 +320,25 @@ pub enum Model {
         interrupts: u64,
         frame_lines: Vec<(usize, u32)>,
         period_ticks: u64,
+        #[serde(default)]
+        ready_after_clear_ticks: Option<u64>,
     },
     /// X-mount lens on its serial port; follows the GPIO and reset-gate nodes.
     Lens {
         port: u64,
         page: Vec<u8>,
         replies: Vec<(u32, u16)>,
+        /// Commands the declared lens answers with the protocol error bit.
+        #[serde(default)]
+        rejected_commands: Vec<u32>,
+        /// Menu harness: extended-data command advertises zero pages.
+        #[serde(default)]
+        empty_extended_data: bool,
         power: (usize, usize, usize),
+        #[serde(default)]
+        power_active_low: bool,
+        #[serde(default)]
+        power_enable: Option<(usize, usize, usize)>,
         ready: (usize, usize),
         line: usize,
         contacts: Vec<(usize, usize, bool)>,
@@ -330,6 +356,8 @@ pub enum Model {
     Renderer {
         base: u64,
         irq: u32,
+        #[serde(default)]
+        copy_latency_divisor: Option<u64>,
     },
     /// Shutter motor and sensors on the GPIO banks; follows the GPIO node.
     Shutter {
@@ -359,6 +387,7 @@ pub enum Model {
 }
 pub struct Built {
     pub board: Board,
+    pub resources: fujimod_emulator_exr2_resources::Resources,
     pub nodes: BTreeMap<String, usize>,
     pub inputs: Vec<(String, Level, usize)>,
     pub contacts: BTreeMap<String, fujimod_emulator_devices::parts::card_contacts::Contacts>,
@@ -528,6 +557,20 @@ pub fn build(
     // reset/gate lines for SD and the lens, the lens link for the PL330.
     let mut pins = None;
     let mut gates: Option<(Vec<resets::ResetPulses>, resets::ExternalLines)> = None;
+    let mut captures: BTreeMap<u64, crate::input_capture::InputCapture> = spec.nodes.iter().filter_map(|node| {
+        match node.model {
+            Model::InputCaptureIdle { base, channels } => Some(
+                crate::input_capture::InputCapture::new(base, channels).map(|model| (base, model))
+            ),
+            Model::InputCaptureSequence { base, channels, irq } => Some(
+                crate::input_capture::InputCapture::new(base, channels)
+                    .and_then(|model| model.with_sequence_end_irq(irq)).map(|model| (base, model))
+            ),
+            _ => None,
+        }
+    }).collect::<Result<_, String>>()?;
+    let capture_sources: Vec<Arc<dyn pl330::Source>> = captures.values()
+        .map(|model| Arc::new(model.counter_source()) as Arc<dyn pl330::Source>).collect();
     let lens_link = spec
         .nodes
         .iter()
@@ -549,7 +592,18 @@ pub fn build(
         } => Some((*base, blocks::Published::default(), *white_balance)),
         _ => None,
     });
+    let mut resources = fujimod_emulator_exr2_resources::Resources::default();
+    for (name, layout) in spec.images {
+        fujimod_emulator_exr2_images::images_mut(&mut resources)?.images.insert(
+            name, fujimod_emulator_imaging::scene::ImageFrames::new(layout)?,
+        );
+    }
+    let mut pending_image_users = Vec::new();
     let mut color_published = false;
+    let sequence_nodes: Vec<_> = spec.nodes.iter()
+        .filter(|node| matches!(node.model, Model::InputCaptureSequence { .. }))
+        .map(|node| node.name.clone()).collect();
+    let mut counter_dma_dependencies = Vec::new();
     for node in spec.nodes {
         if nodes.contains_key(&node.name) {
             return Err("Repeated X-Processor Pro node".into());
@@ -573,10 +627,16 @@ pub fn build(
                 let base = options.base;
                 devices.register(base, 0x1000, Box::new(clocks::ClockControl::new(options)?))?
             }
-            Model::Boot { options, keys } => {
+            Model::Boot { options, keys, high_keys } => {
+                if high_keys.iter().any(|name| !keys.contains(name)) {
+                    return Err("High boot contact is not a declared key".into());
+                }
                 let contacts: Vec<_> = keys
                     .into_iter()
-                    .map(|name| (name, Level::new(false)))
+                    .map(|name| {
+                        let high = high_keys.contains(&name);
+                        (name, Level::new(high))
+                    })
                     .collect();
                 let windows = [
                     (options.selector_base, 0x1000),
@@ -598,8 +658,20 @@ pub fn build(
                     options,
                     contacts.iter().map(|(_, l)| l.clone()).collect(),
                 )?;
+                if gates.is_some() {
+                    return Err("Repeated X-Processor Pro reset/gate bank".into());
+                }
+                let lines = (0..3)
+                    .map(|channel| model.sd_reset(channel))
+                    .collect::<Result<Vec<_>, _>>()?;
+                gates = Some((lines, model.external_lines()));
                 let id = devices.register_windows(windows, Box::new(model))?;
                 for (name, level) in contacts {
+                    if resources.wires.insert(name.clone(),
+                        fujimod_emulator_exr2_resources::Wire::LogicLevel(level.clone())).is_some() {
+                        return Err("Repeated X-Processor Pro boot input".into());
+                    }
+                    resources.users.entry(name.clone()).or_default().insert(id);
                     inputs.push((name, level, id));
                 }
                 id
@@ -652,6 +724,11 @@ pub fn build(
                     model: timer::TickTimers::new(&routes)?,
                     scheduled: None,
                 }),
+            )?,
+            Model::InputCaptureIdle { base, .. } | Model::InputCaptureSequence { base, .. } => devices.register(
+                base,
+                0x1000,
+                Box::new(captures.remove(&base).ok_or("duplicate input capture bank")?),
             )?,
             Model::SerialConfiguration { base } => devices.register(
                 base,
@@ -767,6 +844,15 @@ pub fn build(
                     color_published = true;
                 }
                 if let Some(image) = live_view_image {
+                    if let Some(name) = image.input {
+                        if image.scene.is_some() || image.host_image.is_some() || image.film.is_some() {
+                            return Err("a live-view image has one source".into());
+                        }
+                        let input = fujimod_emulator_exr2_images::images(&resources)?
+                            .images.get(&name).cloned().ok_or("missing XPP image input")?;
+                        model = model.with_live_view_input(image.lines, input)?;
+                        pending_image_users.push((name, node.name.clone()));
+                    } else {
                     model = match (image.scene.as_deref(), image.host_image) {
                         (None, None) => match image.film {
                             None => model.with_live_view_image(image.lines, image.ycbcr)?,
@@ -802,6 +888,7 @@ pub fn build(
                             return Err(format!("unknown live-view scene {other}"));
                         }
                     };
+                    }
                 }
                 if !fixed.is_empty() {
                     model = model.with_fixed(fixed)?;
@@ -994,6 +1081,7 @@ pub fn build(
                 interrupts,
                 frame_lines,
                 period_ticks,
+                ready_after_clear_ticks,
             } => devices.register_windows(
                 vec![
                     Mapping {
@@ -1010,13 +1098,17 @@ pub fn build(
                     interrupts,
                     frame_lines,
                     period_ticks,
-                )?),
+                )?.with_ready_after_clear(ready_after_clear_ticks)?),
             )?,
             Model::Lens {
                 port,
                 page,
                 replies,
+                rejected_commands,
+                empty_extended_data,
                 power,
+                power_active_low,
+                power_enable,
                 ready,
                 line,
                 contacts,
@@ -1031,6 +1123,8 @@ pub fn build(
                     lens::Profile {
                         page,
                         replies: replies.into_iter().collect(),
+                        rejected_commands,
+                        empty_extended_data,
                     },
                     lens::Timing {
                         ready: ready_ticks,
@@ -1041,6 +1135,8 @@ pub fn build(
                     lens::Wiring {
                         base: port,
                         power,
+                        power_active_low,
+                        power_enable,
                         ready,
                         line,
                         contacts,
@@ -1060,10 +1156,11 @@ pub fn build(
                     None,
                 )),
             )?,
-            Model::Renderer { base, irq } => devices.register(
+            Model::Renderer { base, irq, copy_latency_divisor } => devices.register(
                 base,
                 0x3000,
-                Box::new(fujimod_emulator_ip_dmp::smaph::Renderer::new(base, irq)?),
+                Box::new(fujimod_emulator_ip_dmp::smaph::Renderer::new(base, irq)?
+                    .with_copy_latency_divisor(copy_latency_divisor.unwrap_or(1))?),
             )?,
             Model::Shutter {
                 mode,
@@ -1153,17 +1250,26 @@ pub fn build(
                                 .iter()
                                 .map(|link| Arc::new(link.clone()) as Arc<dyn pl330::Source>),
                         )
+                        .chain(capture_sources.iter().cloned())
                         .collect(),
                     pl330::Throughput {
                         setup_ticks,
                         bytes_per_tick,
                     },
                 )?;
-                devices.register(dma, 0x1000, Box::new(engine))?;
+                counter_dma_dependencies.push(devices.register(dma, 0x1000, Box::new(engine))?);
                 id
             }
         };
         nodes.insert(node.name, id);
+    }
+    for (name, node) in pending_image_users {
+        resources.image_users.entry(name).or_default().insert(nodes[&node]);
+    }
+    // DMA writes change the shared counter state without MMIO on the counter
+    // node. Wake its deadline through the native dependency graph.
+    for name in sequence_nodes {
+        devices.depend_on(nodes[&name], counter_dma_dependencies.clone())?;
     }
     if color.is_some() && !color_published {
         return Err("the still color unit must be a register block".into());
@@ -1186,6 +1292,7 @@ pub fn build(
     }
     Ok(Built {
         board,
+        resources,
         nodes,
         inputs,
         contacts: card_contacts,
@@ -1224,6 +1331,26 @@ mod tests {
         build(graph(), spec, &BTreeMap::new(), Mode::Strict)
     }
 
+    #[test]
+    fn dma_counter_sequences_declare_a_native_deadline_dependency() {
+        let spec = serde_json::from_value(json!({
+            "kind":"xpp","cpus":[{"mpidr":0x80000000_u32,"configuration_base":0xffff0000_u32,"cycles_per_tick":64}],
+            "gic":{"distributor":0xffff1000_u64,"cpu_interface":0xffff2000_u64,"lines":512},
+            "nodes":[
+                {"name":"counter","model":{"kind":"input-capture-sequence","base":0xfff2f000_u64,"channels":5,"irq":90}},
+                {"name":"flash","model":{"kind":"flash","controller":0xfff17000_u64,"aperture":0xf0000000_u64,"size":4096,
+                    "asset":"flash","dma":0xfff18000_u64,"irq_routes":[207,208,209,210,211,212,213,214],
+                    "setup_ticks":1,"bytes_per_tick":16,"transfer_ticks":1,"nor":[]}}
+            ]
+        })).unwrap();
+        let built = build(graph(), spec, &BTreeMap::from([("flash".into(),vec![0xff;4096])]), Mode::Strict).unwrap();
+        let state = built.board.state();
+        let devices = state["bus"]["devices"].as_array().unwrap();
+        let counter = &devices[built.nodes["counter"]];
+        let dependencies = counter["native_dependencies"].as_array().unwrap();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(devices[dependencies[0].as_u64().unwrap() as usize]["kind"], "pl330");
+    }
     #[test]
     fn graph_nodes_take_the_x_t20_imaging_and_key_inputs() {
         // X-T20 2.11 values: the idle serial channel 3, the statistics scene

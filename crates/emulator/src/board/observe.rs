@@ -135,4 +135,8 @@ impl Board {
     pub fn pc_entries(&self) -> Vec<Value> {
         self.entries.borrow().0.values().cloned().collect()
     }
+    /// Start a fresh observation interval while retaining installed passive hooks.
+    pub fn clear_pc_entries(&self) {
+        self.entries.borrow_mut().0.clear();
+    }
 }

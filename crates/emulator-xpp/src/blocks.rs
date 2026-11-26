@@ -186,6 +186,7 @@ pub struct Block {
     work: Option<Work>,
     /// Lines and the Y0 Y1 Cb Cr pixel pair of a uniform live-view image.
     image: Option<(u32, Picture)>,
+    external_image: Option<fujimod_emulator_imaging::scene::ImageFrames>,
     /// (offset, value) of words that read a fixed value whatever is written.
     fixed: Vec<(u64, u32)>,
     commands: Vec<Command>,
@@ -227,6 +228,7 @@ impl Block {
             job: None,
             work: None,
             image: None,
+            external_image: None,
             fixed: Vec::new(),
             commands: Vec::new(),
             published: None,
@@ -456,6 +458,40 @@ impl Block {
     pub fn with_live_view_scene(self, lines: u32) -> Result<Self, String> {
         self.with_picture(lines, Picture::Scene)
     }
+    /// Dynamic post-ISP input owned and checkpointed by the board resources.
+    pub fn with_live_view_input(
+        mut self, lines: u32, input: fujimod_emulator_imaging::scene::ImageFrames,
+    ) -> Result<Self, String> {
+        self = self.with_live_view_image(lines, [16, 128, 128])?;
+        self.external_image = Some(input);
+        Ok(self)
+    }
+    fn external_frame(&self, width: usize, height: usize) -> Result<Option<Vec<u8>>, String> {
+        let Some(input) = &self.external_image else { return Ok(None); };
+        let frame = input.0.lock().map_err(|_| "XPP image input poisoned")?;
+        let Some(pixels) = &frame.prepared else { return Ok(None); };
+        let layout = frame.layout;
+        let mut out = vec![0; width * height * 2];
+        // Shared image inputs use full-range YYCbCr; the XPP live-view model
+        // declares limited-range BT.601. Resample pairs without mixing rows.
+        let luma = |v: u8| (16 + (u32::from(v)*219+127)/255) as u8;
+        let chroma = |v: u8| (128 + (i32::from(v)-128)*224/255) as u8;
+        for y in 0..height {
+            let row = (y*layout.height/height)*layout.stride;
+            for x in (0..width).step_by(2) {
+                let a = x*layout.width/width;
+                let b = (x+1)*layout.width/width;
+                let ia = row + (a & !1)*2;
+                let ib = row + (b & !1)*2;
+                let dest = (y*width+x)*2;
+                out[dest..dest+4].copy_from_slice(&[
+                    luma(pixels[ia+(a&1)]), luma(pixels[ib+(b&1)]),
+                    chroma(pixels[ia+2]), chroma(pixels[ia+3]),
+                ]);
+            }
+        }
+        Ok(Some(out))
+    }
     /// A host RGB image (post-ISP) sampled at each frame, over `lines` lines.
     pub fn with_live_view_host_image(
         self,
@@ -496,7 +532,13 @@ impl Block {
             return cx.fail("Unsupported live-view line width");
         }
         let (width, lines) = (u64::from(width), u64::from(*lines));
-        let image = match picture {
+        let external = match self.external_frame(width as usize, lines as usize) {
+            Ok(image) => image,
+            Err(error) => return cx.fail(error),
+        };
+        let image = match external {
+            Some(image) => Ok(image),
+            None => match picture {
             Picture::Uniform(pair) => Ok(pair.repeat((width / 2 * lines) as usize)),
             Picture::Film(linear, unprogrammed) => {
                 let pair = match &self.color {
@@ -545,6 +587,7 @@ impl Block {
                     },
                 )
             }
+            },
         };
         let Ok(image) = image else {
             return cx.fail("Live-view scene output refused");
@@ -1009,6 +1052,36 @@ mod tests {
         program(None, reference);
         words.lock().unwrap().insert(0x440, 0);
         assert_eq!(frame(&mut unit, &mut h, 60), [0; 4]);
+    }
+
+    #[test]
+    fn dynamic_live_view_input_changes_next_frame_and_restores_without_inline_pixels() {
+        use fujimod_emulator_devices::test_host::advance;
+        use fujimod_emulator_imaging::{analysis::ImageLayout, scene::ImageFrames};
+        let input = ImageFrames::new(ImageLayout { width: 4, height: 2, stride: 8 }).unwrap();
+        let rgb = [0,0,0, 255,255,255, 0,0,0, 255,255,255].repeat(2);
+        input.prepare_rgb(4, 2, &rgb).unwrap();
+        let saved = input.checkpoint().unwrap();
+        let frames = Frames { start: (0xc8, 1<<28), stopped: (0xd8, 0x100), irq: 108, period: 10 };
+        let mut unit = Block::new(BASE, 0x200, vec![(0,1)], Some(frames)).unwrap()
+            .with_live_view_input(2, input.clone()).unwrap();
+        let mut h = TestHost::new();
+        write(&mut unit, &mut h, BASE+BUFFER, 0x1000);
+        write(&mut unit, &mut h, BASE+WIDTH, 4);
+        write(&mut unit, &mut h, BASE+0xc8, 1<<28);
+        advance(&mut unit, &mut h, 10);
+        let first = h.ram[0x1000..0x1010].to_vec();
+        assert_eq!(first, [16,235,128,128].repeat(4));
+        input.prepare_rgb(4,2,&[0;24]).unwrap();
+        advance(&mut unit, &mut h, 20);
+        assert_eq!(&h.ram[0x1000..0x1010], [16,16,128,128].repeat(4));
+        input.restore_checkpoint(&saved, None).unwrap();
+        advance(&mut unit, &mut h, 30);
+        assert_eq!(&h.ram[0x1000..0x1010], first);
+        assert_eq!(unit.external_frame(8,2).unwrap().unwrap()[..8], [16,16,128,128,235,235,128,128]);
+        input.use_analytic();
+        advance(&mut unit, &mut h, 40);
+        assert_eq!(&h.ram[0x1000..0x1010], [16,16,128,128].repeat(4));
     }
 
     #[test]

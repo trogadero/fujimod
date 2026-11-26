@@ -49,7 +49,14 @@ export type ReplayStep =
   | { action: 'rotate'; id: string; steps: number }
   | { action: 'touch'; id: string; phase: TouchPhase; x: number; y: number }
   | { action: 'advance'; ticks: number };
+export interface ExperimentalFirmware {
+  baseId: string;
+  expectedSha256: string;
+  actualSha256: string;
+}
 export interface EngineConfig {
+  /** Explicit approval for this uploaded DAT only; never persisted with a camera. */
+  experimentalFirmware?: ExperimentalFirmware;
   camera?: { id: string; revision: number; modEnabled: boolean };
   firmwareId: string;
   bundle: string;

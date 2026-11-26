@@ -45,7 +45,7 @@ declare class Camera {
      */
     frame(output: number): Frame | undefined;
     /**
-     * Construct an EXR II camera from its device graph document and DAT.
+     * Construct an EXR II or XPP camera from its explicit device graph and DAT.
      */
     static fromGraph(config: string, dat: Uint8Array): Camera;
     /**

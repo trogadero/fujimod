@@ -224,6 +224,64 @@ fn camera_sections(
     Ok(camera)
 }
 
+/// Explicit XPP graph supplied by the caller; no inferred body addresses.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct XppConfig {
+    schema: u32,
+    firmware_id: String,
+    graph: XppGraph,
+    boot_source: Option<BootSource>,
+    #[serde(default)]
+    initial_positions: BTreeMap<String, String>,
+    #[serde(default)]
+    boot_inputs: Vec<super::lifecycle::BootInput>,
+    clock_seconds2000: Option<u32>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct XppGraph {
+    schema: u32,
+    firmware_id: String,
+    execution: factory::Graph,
+    devices: fujimod_emulator_xpp::board::Spec,
+    assets: BTreeMap<String, Asset>,
+    firmware: Firmware,
+    quantum: usize,
+    scanout: Option<String>,
+    #[serde(default)]
+    controls: Option<fujimod_emulator_devices::parts::switch_panel::Spec>,
+    #[serde(default)]
+    contact_driver: Option<fujimod_emulator_session::contact_driver::Spec>,
+    #[serde(default)]
+    card: Option<Card>,
+    #[serde(default)]
+    storage: Option<fujimod_emulator_session::durable::Spec>,
+    scene: Option<Scene>,
+}
+
+// XPP's RTC belongs to the serial register peer. Keep the effective graph
+// alongside the board so checkpoint identities include the requested epoch.
+fn apply_xpp_clock(devices: &mut serde_json::Value, seconds: u32) -> Result<(), String> {
+    let nodes = devices["nodes"].as_array_mut().ok_or("XPP device nodes absent")?;
+    let mut clocks = 0;
+    for node in nodes {
+        let model = &mut node["model"];
+        if model["kind"] == "serial-port" && model["peer"]["kind"] == "registers" {
+            if let Some(clock) = model["peer"]["clock"].as_object_mut() {
+                if clock.contains_key("seconds") {
+                    clock.insert("seconds".into(), serde_json::json!(seconds));
+                    clocks += 1;
+                }
+            }
+        }
+    }
+    if clocks != 1 {
+        return Err("XPP graph has no single real-time clock".into());
+    }
+    Ok(())
+}
+
 /// Everything a constructed camera needs beyond its boot-time core session.
 struct Attachments {
     quantum: usize,
@@ -389,6 +447,9 @@ impl Session {
         let identity: DefinitionEnvelope =
             serde_json::from_slice(config).map_err(|e| e.to_string())?;
         let mut definition = serde_json::to_value(identity.graph).map_err(|e| e.to_string())?;
+        if definition["devices"]["kind"] == "xpp" {
+            return Self::create_xpp_camera(config, dat, policy);
+        }
         let c: Config = serde_json::from_slice(config).map_err(|e| e.to_string())?;
         let mut g = c.graph;
         if c.schema != 1
@@ -450,11 +511,9 @@ impl Session {
         let identity = camera_identity(&g.firmware_id, &g.firmware.sha256, &storage)?;
         let built = g.devices.build(resources, 0, &mut RefuseAdapters)?;
         let bus = Bus::from_graph(Mode::Strict, built.graph)?;
-        let mut board = g.execution.build(
-            factory::Options::new(factory::Engine::Unicorn),
-            bus,
-            None,
-        )?;
+        let mut board =
+            g.execution
+                .build(factory::Options::new(factory::Engine::Unicorn), bus, None)?;
         board.set_execution_policy(policy)?;
         for irq in built.core_interrupts {
             board.configure_core_interrupts(irq.core, irq.device, Box::new(irq.inputs))?;
@@ -502,6 +561,96 @@ impl Session {
         Ok(session)
     }
 
+    /// Run an explicitly configured XPP graph through the shared device models.
+    fn create_xpp_camera(
+        config: &[u8],
+        dat: &[u8],
+        policy: fujimod_emulator_cpu::ExecutionPolicy,
+    ) -> Result<Self, String> {
+        let construction = super::snapshot::Construction::camera(config, dat);
+        let mut definition: serde_json::Value =
+            serde_json::from_slice(config).map_err(|e| e.to_string())?;
+        let c: XppConfig = serde_json::from_slice(config).map_err(|e| e.to_string())?;
+        if c.boot_source == Some(BootSource::Sd) {
+            return Err("XPP graph has no ROM SD startup".into());
+        }
+        let mut g = c.graph;
+        if c.schema != 1 || g.schema != 1 || g.quantum == 0 || c.firmware_id != g.firmware_id {
+            return Err("XPP graph identity/schema/quantum mismatch".into());
+        }
+        if let Some(seconds) = c.clock_seconds2000 {
+            apply_xpp_clock(&mut definition["graph"]["devices"], seconds)?;
+            g.devices = serde_json::from_value(definition["graph"]["devices"].clone())
+                .map_err(|e| e.to_string())?;
+        }
+        let images = decode(&g.firmware, dat)?;
+        let assets = g
+            .assets
+            .into_iter()
+            .map(|(name, asset)| Ok((name, asset.build(dat)?)))
+            .collect::<Result<BTreeMap<_, _>, String>>()?;
+        let built =
+            fujimod_emulator_xpp::board::build(g.execution, g.devices, &assets, Mode::Strict)?;
+        let mut core = fujimod_emulator_session::Session {
+            definition,
+            controls: None,
+            contact_driver: None,
+            board: built.board,
+            resources: built.resources,
+            nodes: built.nodes,
+            contacts: built.contacts,
+            recording_frames: Default::default(),
+        };
+        core.board.set_execution_policy(policy)?;
+        for image in images {
+            core.board.write_physical(image.base, &image.bytes)?;
+        }
+        if let Some(name) = &g.scanout {
+            core.node(name)?;
+        }
+        if let Some(scene) = &g.scene {
+            if scene.sensor.is_some() || scene.white_luminance.is_some() {
+                return Err("XPP scene currently accepts only post-ISP RGB input".into());
+            }
+            let node = core.node(&scene.node)?;
+            if !core.resources.image_users(&scene.images)?.contains(&node) {
+                return Err("XPP scene node is not a consumer of the named image".into());
+            }
+        }
+        let storage = g.storage.unwrap_or_default();
+        if let Some(card) = &g.card {
+            if !storage.cards.contains(&card.node) {
+                return Err("XPP visible SD card must be declared in durable storage".into());
+            }
+            if core.card_state(&card.node)?.capacity_bytes != u64::from(card.format.sectors) * 512 {
+                return Err("XPP SD format geometry differs from its device".into());
+            }
+        }
+        let media = fujimod_emulator_session::durable::Media::capture(&core, &storage)?;
+        media.validate(&core, &storage)?;
+        let identity = camera_identity(&g.firmware_id, &g.firmware.sha256, &storage)?;
+        let mut session = Self::start_camera(
+            core,
+            Attachments {
+                quantum: g.quantum,
+                gpio: vec![],
+                watch_pcs: vec![],
+                card: g.card,
+                scene: g.scene,
+                preview: None,
+                controls: g.controls,
+                contact_driver: g.contact_driver,
+                storage,
+                identity,
+                scanout: g.scanout,
+                initial_positions: c.initial_positions,
+                boot_inputs: c.boot_inputs,
+            },
+        )?;
+        session.construction = Some(construction);
+        Ok(session)
+    }
+
     /// Apply the browser attachments to a booted core and start its checkpoint.
     fn start_camera(
         mut core: fujimod_emulator_session::Session,
@@ -537,10 +686,7 @@ impl Session {
             }
             let images = core.resources.images()?;
             if !images.has_image(&scene.images)
-                || scene
-                    .sensor
-                    .as_ref()
-                    .is_some_and(|s| !images.has_sensor(s))
+                || scene.sensor.as_ref().is_some_and(|s| !images.has_sensor(s))
             {
                 return Err("session scene input is not in the declared graph".into());
             }
@@ -573,5 +719,54 @@ impl Session {
         }
         session.boot_holds(&a.boot_inputs)?;
         Ok(session)
+    }
+}
+
+#[cfg(test)]
+mod xpp_constructor_tests {
+    use super::*;
+    use serde_json::json;
+    fn document() -> serde_json::Value {
+        json!({"schema":1,"firmwareId":"xpro2-511","graph":{
+            "schema":1,"firmwareId":"xpro2-511","quantum":4096,
+            "execution":{"processors":[],"ram":[],"mappings":[],"peripherals":[],"dma_mappings":[],"decoders":[],"instructions_per_tick":[1,1]},
+            "devices":{"kind":"xpp","cpus":[],"gic":{"distributor":0xffff1000_u64,"cpu_interface":0xffff2000_u64,"lines":32},"nodes":[]},
+            "assets":{},"firmware":{"size":4,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","format":"dat","mappings":[]},"scanout":null
+        }})
+    }
+    #[test]
+    fn xpp_clock_override_reaches_the_serial_peer() {
+        let mut devices = json!({"nodes":[{"model":{"kind":"serial-port","peer":{
+            "kind":"registers","registers":[],"clock":{"first":65,"hold":69,"seconds":123,"ticks_per_second":48000000}
+        }}}]});
+        apply_xpp_clock(&mut devices, 0).unwrap();
+        let spec: fujimod_emulator_xpp::board::Peer =
+            serde_json::from_value(devices["nodes"][0]["model"]["peer"].clone()).unwrap();
+        let fujimod_emulator_xpp::board::Peer::Registers { clock: Some(clock), .. } = spec else { panic!("RTC missing") };
+        assert_eq!(clock.seconds, 0);
+        assert_eq!(clock.ticks_per_second, 48000000);
+        assert!(apply_xpp_clock(&mut json!({"nodes":[]}), 0).is_err());
+    }
+    #[test]
+    fn xpp_rejects_wrong_firmware_before_processor_construction() {
+        let config = serde_json::to_vec(&document()).unwrap();
+        let error =
+            Session::create_camera(&config, &[], fujimod_emulator_cpu::ExecutionPolicy::Exact)
+                .err()
+                .unwrap();
+        assert_eq!(error, "firmware size/SHA-256 mismatch");
+    }
+    #[test]
+    fn xpp_rejects_mismatched_graph_identity() {
+        let mut config = document();
+        config["firmwareId"] = "other".into();
+        let error = Session::create_camera(
+            &serde_json::to_vec(&config).unwrap(),
+            &[],
+            fujimod_emulator_cpu::ExecutionPolicy::Exact,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, "XPP graph identity/schema/quantum mismatch");
     }
 }

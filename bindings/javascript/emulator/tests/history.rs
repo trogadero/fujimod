@@ -908,3 +908,102 @@ fn interactive_device_workers_default_inline_and_allow_explicit_stopped_selectio
     );
     handle.core.board.finish().unwrap();
 }
+
+/// Minimal shared XPP fixture; media are explicit caller inputs.
+fn create_xpp_with(configure: impl FnOnce(&mut Value)) -> Session {
+        let firmware = 0xeafffffe_u32.to_le_bytes(); // ARM branch to self.
+        let mut config = json!({"schema":1,"firmwareId":"generated-xpp","graph":{
+            "schema":1,"firmwareId":"generated-xpp","quantum":17,
+            "execution":{
+                "processors":[{"model":"cortex-a7","released":true,"registers":[["Pc",0],["Pstate",211]],"mprofile":null,"rprofile":null}],
+                "ram":[{"base":0,"size":65536}],
+                "mappings":[{"core":0,"address":0,"physical":0,"size":65536,"permissions":7}],
+                "peripherals":[{"core":0,"address":0xffff0000_u64,"physical":0xffff0000_u64,"size":65536}],
+                "dma_mappings":[{"address":0,"physical":0,"size":65536,"permissions":3}],"decoders":[],"instructions_per_tick":[4,1]},
+            "devices":{"kind":"xpp","cpus":[{"configuration_base":0xffff0000_u64,"cache_sizes":[32768,32768,1048576],"cycles_per_tick":64,"mpidr":0x80000000_u64}],
+                "gic":{"distributor":0xffff1000_u64,"cpu_interface":0xffff2000_u64,"lines":32},"nodes":[]},
+            "assets":{},"firmware":{"size":4,"sha256":fujimod_firmware::sha256(&firmware),"format":"raw",
+                "mappings":[{"name":"loop","offset":0,"size":4,"base":0,"encoding":"raw","executable":true}]},"scanout":null
+        }});
+        configure(&mut config);
+        Session::create_camera(&serde_json::to_vec(&config).unwrap(), &firmware, ExecutionPolicy::Exact).unwrap()
+}
+
+/// XPP discovery boards may provide an LCD without image/sensor input resources.
+#[test]
+fn durable_resume_and_restart_without_image_inputs_reset_execution() {
+    let mut source = create_xpp_with(|_| {});
+    assert!(source.core.resources.images.is_none());
+    source.run(100).unwrap();
+    let saved = source.save_durable().unwrap();
+    source.cycle_power(&[]).unwrap();
+    assert_eq!(status_of(&source).instructions, 0);
+    source.run(50).unwrap();
+    assert!(status_of(&source).instructions > 0);
+    let mut resumed = create_xpp_with(|_| {});
+    resumed.load_durable(&saved.durable).unwrap();
+    assert_eq!(status_of(&resumed).instructions, 0);
+    resumed.run(50).unwrap();
+    assert!(status_of(&resumed).instructions > 0);
+}
+
+#[test]
+fn xpp_scene_input_uses_binary_history_and_snapshot_resources() {
+    let mut source = create_xpp_with(|config| {
+        config["graph"]["devices"]["gic"]["lines"] = json!(128);
+        config["graph"]["execution"]["peripherals"].as_array_mut().unwrap().push(
+            json!({"core":0,"address":0xfff90000_u64,"physical":0xfff90000_u64,"size":65536}));
+        config["graph"]["devices"]["images"] = json!({"test-scene":{"width":4,"height":2,"stride":8}});
+        config["graph"]["devices"]["nodes"] = json!([{"name":"preview","model":{
+            "kind":"register-block","base":0xfff95000_u64,"size":4096,"idle":[],
+            "frames":{"start":[200,268435456],"stopped":[216,256],"irq":108,"period_ticks":10},
+            "live_view_image":{"lines":2,"ycbcr":[16,128,128],"input":"test-scene"}}}]);
+        config["graph"]["scene"] = json!({"images":"test-scene","sensor":null,"white_luminance":null,"node":"preview"});
+    });
+    source.set_scene(Some((4,2,[0,0,0,255,255,255].repeat(4)))).unwrap();
+    let expected = source.core.resources.fingerprint().unwrap();
+    let checkpoint = source.checkpoint().unwrap();
+    let snapshot = source.export_snapshot().unwrap();
+    let restored = Session::load_snapshot(&snapshot.snapshot).unwrap();
+    assert_eq!(restored.core.resources.fingerprint().unwrap(), expected);
+    source.set_scene(Some((4,2,vec![0;24]))).unwrap();
+    assert_ne!(source.core.resources.fingerprint().unwrap(), expected);
+    source.restore_checkpoint(&checkpoint.id).unwrap();
+    assert_eq!(source.core.resources.fingerprint().unwrap(), expected);
+    assert!(source.set_scene(Some((4,2,vec![0;23]))).is_err());
+}
+
+#[test]
+fn xpp_two_writable_sd_cards_survive_restart_and_durable_reconstruction() {
+    fn cards() -> Session {
+        create_xpp_with(|config| {
+            let format=json!({"sectors":4194304,"max_dirty_sectors":4096,"partition_start":2048,"sectors_per_cluster":32,"label":"TEST"});
+            config["graph"]["execution"]["peripherals"].as_array_mut().unwrap().push(
+                json!({"core":0,"address":0xfff90000_u64,"physical":0xfff90000_u64,"size":65536}));
+            for (name,base) in [("sd",0xfff92000_u64),("sd1",0xfff93000_u64)] {
+                config["graph"]["devices"]["nodes"].as_array_mut().unwrap().push(json!({
+                    "name":name,"model":{"kind":"sd","options":{"base":base,"register_offset":512,"transfer_ticks":4,"clock_ticks":4,"reset_ticks":4,"rca":1,"ram_bytes":65536},
+                        "format":format,"files":{},"irq":null,"reset_channel":null}}));
+            }
+            config["graph"]["storage"]=json!({"cards":["sd","sd1"],"nands":[]});
+            config["graph"]["card"]=json!({"node":"sd","format":format});
+        })
+    }
+    let mut source=cards();
+    let format=serde_json::from_value(json!({"sectors":4194304,"max_dirty_sectors":4096,"partition_start":2048,"sectors_per_cluster":32,"label":"TEST"})).unwrap();
+    for (name,bytes) in [("sd",vec![1,2,3]),("sd1",vec![4,5,6])] {
+        let state=source.core.card_state(name).unwrap();
+        assert!(state.present && !state.protected);
+        source.core.card_format(name,&format,&[("KEEP.TXT".into(),bytes)]).unwrap();
+    }
+    source.run(50).unwrap();
+    let saved=source.save_durable().unwrap();
+    source.cycle_power(&[]).unwrap();
+    let mut resumed=cards();
+    resumed.load_durable(&saved.durable).unwrap();
+    for session in [&source,&resumed] {
+        assert_eq!(session.core.card_read("sd","KEEP.TXT",None,16).unwrap(),vec![1,2,3]);
+        assert_eq!(session.core.card_read("sd1","KEEP.TXT",None,16).unwrap(),vec![4,5,6]);
+    }
+    assert!(resumed.session_state().unwrap().card.supported);
+}

@@ -111,6 +111,16 @@ test('incremental build plan keeps the fast Cargo profile and light Emscripten l
   assert(!plan.link.includes('-Oz'));
 });
 
+test('explicit optimization applies to Rust and the final Wasm link', () => {
+  for (const level of ['0', '1', '2', '3', 's', 'z']) {
+    const selected = options(['--incremental', '--opt-level', level], '/tmp/project');
+    const plan = buildPlan(selected, { PATH: '/toolchain/bin' });
+    assert.equal(plan.env.CARGO_PROFILE_DIST_OPT_LEVEL, level);
+    assert(plan.link.includes(`-O${level}`));
+    assert.equal(plan.link.filter((flag) => /^-O[0123sz]$/.test(flag)).length, 1);
+  }
+});
+
 test('Unicorn cache reuse requires the configured source and toolchain settings', () => {
   const selected = options(['--out', '/tmp/emulator'], '/tmp/project');
   const plan = buildPlan(selected, {
@@ -222,4 +232,13 @@ test('bindgen declarations move out of the Emscripten module interface', () => {
   );
   assert.doesNotMatch(module, /export default function/);
   assert.throws(() => hoistBindgenDeclarations('interface WasmModule {}'), /no BindgenModule/);
+});
+
+// Above 2 GiB Emscripten must generate unsigned heap indexes for ROM laboratories.
+test('maximum memory keeps the default and supports an explicit larger Wasm heap', () => {
+  assert.equal(options([]).maximumMemory, 2147483648);
+  const selected = options(['--maximum-memory', '3221225472']);
+  assert(buildPlan(selected, {}).link.includes('-sMAXIMUM_MEMORY=3221225472'));
+  for (const value of ['NaN', '0', '33554433', '4295032832'])
+    assert.throws(() => options(['--maximum-memory', value]), /page-aligned bytes/);
 });

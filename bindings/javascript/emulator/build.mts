@@ -37,8 +37,10 @@ export interface BuildOptions {
   cSimd128: boolean;
   lto?: string;
   optLevel?: string;
+  linkOptLevel?: string;
   codegenUnits?: number;
   allocator: 'dlmalloc' | 'emmalloc';
+  maximumMemory: number;
 }
 
 export interface BuildPlan {
@@ -106,6 +108,7 @@ export function options(args: string[], base = root): BuildOptions {
       'opt-level': { type: 'string' },
       'codegen-units': { type: 'string' },
       allocator: { type: 'string', default: 'dlmalloc' },
+      'maximum-memory': { type: 'string', default: '2147483648' },
     },
   });
   const values = parsed.values;
@@ -124,7 +127,12 @@ export function options(args: string[], base = root): BuildOptions {
     throw new Error('--codegen-units must be a positive integer.');
   if (values.allocator !== 'dlmalloc' && values.allocator !== 'emmalloc')
     throw new Error('Invalid --allocator value.');
+  const maximumMemory = Number(values['maximum-memory']);
+  if (!Number.isSafeInteger(maximumMemory) || maximumMemory < 33554432 ||
+      maximumMemory > 4294967296 || maximumMemory % 65536 !== 0)
+    throw new Error('--maximum-memory must be page-aligned bytes between 32 MiB and 4 GiB.');
   return {
+    maximumMemory,
     out: resolve(base, values.out),
     stagePackage: values['stage-package'],
     incremental,
@@ -133,6 +141,7 @@ export function options(args: string[], base = root): BuildOptions {
     cSimd128: values['c-simd128'],
     lto: values.lto ?? (incremental ? 'off' : undefined),
     optLevel: values['opt-level'] ?? (incremental ? '2' : undefined),
+    linkOptLevel: values['opt-level'],
     codegenUnits,
     allocator: values.allocator,
   };
@@ -302,8 +311,9 @@ export function buildPlan(selected: BuildOptions, source: NodeJS.ProcessEnv): Bu
     join(target, 'wasm32-unknown-emscripten/dist/libfujimod_emulator_javascript.a'),
     '-o',
     join(out, 'camera.mjs'),
-    // Keep the standalone module within static hosting's per-file size budget.
-    selected.incremental ? '-O1' : '-Oz',
+    // Explicit optimization requests apply to the final Wasm link too.
+    // Otherwise retain the lightweight incremental / size-oriented defaults.
+    `-O${selected.linkOptLevel ?? (selected.incremental ? '1' : 'z')}`,
     '--no-entry',
     '-pthread',
     '-sPTHREAD_POOL_SIZE=2',
@@ -318,7 +328,7 @@ export function buildPlan(selected: BuildOptions, source: NodeJS.ProcessEnv): Bu
     '-sENVIRONMENT=web,worker,node',
     '-sALLOW_MEMORY_GROWTH=1',
     '-sINITIAL_MEMORY=33554432',
-    '-sMAXIMUM_MEMORY=2147483648',
+    `-sMAXIMUM_MEMORY=${selected.maximumMemory}`,
     '-sSTACK_SIZE=2097152',
     '-sFILESYSTEM=0',
     '-sNO_EXIT_RUNTIME=1',
@@ -615,9 +625,11 @@ export function build(selected: BuildOptions) {
       incremental: plan.env.CARGO_PROFILE_DIST_INCREMENTAL === 'true',
     },
     incremental: selected.incremental,
+    link_opt_level: plan.link.find((flag) => /^-O[0123sz]$/.test(flag)),
     rust_flags: plan.rustFlags,
     c_flags: plan.cFlags,
     allocator: selected.allocator,
+    maximum_memory: selected.maximumMemory,
     simd128: { rust: selected.rustSimd128, c: selected.cSimd128 },
     unicorn_commit: capture(['git', 'rev-parse', 'HEAD'], vendor).trim(),
     unicorn_dirty: false,
@@ -635,7 +647,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   const args = process.argv.slice(2);
   if (args.includes('--help') || args.includes('-h')) {
     console.log(
-      'Usage: node emulator/build.mts [--out DIR] [--stage-package] [--incremental] [--profiling] [--rust-simd128] [--c-simd128] [--lto thin|fat|off] [--opt-level 0|1|2|3|s|z] [--codegen-units N] [--allocator dlmalloc|emmalloc]',
+      'Usage: node emulator/build.mts [--out DIR] [--stage-package] [--incremental] [--profiling] [--rust-simd128] [--c-simd128] [--lto thin|fat|off] [--opt-level 0|1|2|3|s|z] [--codegen-units N] [--allocator dlmalloc|emmalloc] [--maximum-memory BYTES]',
     );
   } else {
     build(options(args));

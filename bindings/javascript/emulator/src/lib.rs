@@ -267,7 +267,7 @@ impl Camera {
     pub fn from_resolved(config: &str, firmware: &[u8]) -> Result<Camera, Failure> {
         Self::new(Session::create(config.as_bytes(), firmware, policy()?))
     }
-    /// Construct an EXR II camera from its device graph document and DAT.
+    /// Construct an EXR II or XPP camera from its explicit device graph and DAT.
     #[wasm_bindgen(js_name = fromGraph)]
     pub fn from_graph(config: &str, dat: &[u8]) -> Result<Camera, Failure> {
         Self::new(Session::create_camera(config.as_bytes(), dat, policy()?))
